@@ -1,9 +1,9 @@
 // ============================================================
-// Maricopa · Inventory + Orders Management API
+// Maricopa · Inventory + Orders Management API (MongoDB)
 // server.js
 // ============================================================
 // Run with:  node server.js
-// Requires:  npm install express cors helmet express-rate-limit
+// Requires:  npm install express cors helmet express-rate-limit mongodb
 // Optional:  npm install compression
 // ============================================================
 
@@ -16,9 +16,9 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const { MongoClient } = require('mongodb');
 
 // Optional compression — gracefully skipped if not installed
 let compression = null;
@@ -32,9 +32,15 @@ function loadConfig(env = process.env) {
     PORT: Number(env.PORT) || 3000,
     HOST: env.HOST || '0.0.0.0',
     NODE_ENV: env.NODE_ENV || 'development',
-    DATA_DIR: path.join(__dirname, 'data'),
-    DB_FILE: path.join(__dirname, 'data', 'inventory.json'),
-    ORDERS_DB_FILE: path.join(__dirname, 'data', 'orders.json'),
+
+    // ---- MongoDB ----
+    MONGODB_URI: env.MONGODB_URI ||
+      'mongodb+srv://MedAI:Griff2009.@medai.qjvleue.mongodb.net/?retryWrites=true&w=majority',
+    MONGODB_DB: env.MONGODB_DB || 'maricopa',
+    INVENTORY_COLLECTION: env.INVENTORY_COLLECTION || 'inventory',
+    ORDERS_COLLECTION: env.ORDERS_COLLECTION || 'orders',
+    MONGO_CONNECT_TIMEOUT_MS: Number(env.MONGO_CONNECT_TIMEOUT_MS) || 10000,
+
     PUBLIC_DIR: path.join(__dirname, 'public'),
     BODY_LIMIT: env.BODY_LIMIT || '1mb',
     SHUTDOWN_TIMEOUT_MS: Number(env.SHUTDOWN_TIMEOUT_MS) || 5000,
@@ -61,6 +67,9 @@ function loadConfig(env = process.env) {
   }
   if (!Number.isFinite(cfg.SHUTDOWN_TIMEOUT_MS) || cfg.SHUTDOWN_TIMEOUT_MS < 1000) {
     throw new Error('SHUTDOWN_TIMEOUT_MS must be >= 1000');
+  }
+  if (!/^mongodb(\+srv)?:\/\//.test(cfg.MONGODB_URI)) {
+    throw new Error('MONGODB_URI must start with mongodb:// or mongodb+srv://');
   }
 
   return Object.freeze(cfg);
@@ -121,108 +130,168 @@ function createMetrics() {
 }
 
 // ============================================================
-// 4. REPOSITORIES — pluggable persistence (inventory + orders)
+// 4. MONGODB CLIENT — shared, lazy-connect, auto-reconnect
 // ============================================================
-function createJsonFileRepository(filePath, config, logger, label = 'data') {
+function createMongoClient(config, logger) {
+  const client = new MongoClient(config.MONGODB_URI, {
+    serverSelectionTimeoutMS: config.MONGO_CONNECT_TIMEOUT_MS,
+    maxPoolSize: 20,
+    retryWrites: true
+  });
+
+  let connectPromise = null;
+  let closed = false;
+
+  async function getClient() {
+    if (closed) throw new Error('Mongo client is closed');
+    if (!connectPromise) {
+      connectPromise = client.connect().then(() => {
+        logger.info('MongoDB connected', {
+          db: config.MONGODB_DB,
+          host: (() => { try { return new URL(config.MONGODB_URI.replace('mongodb+srv://', 'https://').replace('mongodb://', 'http://')).host; } catch { return 'unknown'; } })()
+        });
+        return client;
+      }).catch(err => {
+        connectPromise = null;
+        logger.error('MongoDB connection failed', { error: err.message });
+        throw err;
+      });
+    }
+    return connectPromise;
+  }
+
+  return {
+    async db() {
+      const c = await getClient();
+      return c.db(config.MONGODB_DB);
+    },
+    async close() {
+      closed = true;
+      try { await client.close(); } catch (_) { /* ignore */ }
+    },
+    raw: client
+  };
+}
+
+// ============================================================
+// 5. MONGODB REPOSITORIES
+//    Same interface as before (ensure/readAll/findById/create/update/remove/clear/count)
+//    so routes + validators need ZERO changes.
+// ============================================================
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function createMongoRepository(collectionName, mongo, config, logger, label) {
   return {
     async ensure() {
-      await fs.mkdir(config.DATA_DIR, { recursive: true });
       try {
-        await fs.access(filePath);
-      } catch {
-        await fs.writeFile(filePath, '[]', 'utf8');
+        const db = await mongo.db();
+        const coll = db.collection(collectionName);
+
+        // Indexes — safe to create every boot (idempotent)
+        if (label === 'inventory') {
+          await coll.createIndex({ sku: 1 }, { unique: true });
+          await coll.createIndex({ name: 1 });
+          await coll.createIndex({ category: 1 });
+        }
+        if (label === 'orders') {
+          await coll.createIndex(
+            { reference: 1 },
+            { unique: true, sparse: true, partialFilterExpression: { reference: { $type: 'string', $ne: '' } } }
+          );
+          await coll.createIndex({ status: 1 });
+          await coll.createIndex({ date: -1 });
+        }
+        await coll.createIndex({ id: 1 }, { unique: true });
+        await coll.createIndex({ createdAt: -1 });
+
+        logger.info(`MongoDB ${label} collection ready`, { collection: collectionName });
+      } catch (err) {
+        logger.error(`MongoDB ${label} ensure() failed`, { error: err.message });
+        throw err;
       }
     },
 
     async readAll() {
-      await this.ensure();
-      const raw = await fs.readFile(filePath, 'utf8');
-      try {
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? parsed : [];
-      } catch (err) {
-        logger.warn(`Corrupt ${label} file — resetting`, { error: err.message, file: filePath });
-        await fs.writeFile(filePath, '[]', 'utf8');
-        return [];
-      }
-    },
-
-    async writeAll(items) {
-      await this.ensure();
-      const tmp = filePath + '.tmp';
-      await fs.writeFile(tmp, JSON.stringify(items, null, 2), 'utf8');
-      await fs.rename(tmp, filePath); // atomic swap
+      const db = await mongo.db();
+      return db.collection(collectionName)
+        .find({}, { projection: { _id: 0 } })
+        .sort({ createdAt: -1 })
+        .toArray();
     },
 
     async findById(id) {
-      const items = await this.readAll();
-      return items.find(i => i.id === id) || null;
+      const db = await mongo.db();
+      return db.collection(collectionName).findOne({ id }, { projection: { _id: 0 } });
     },
 
     async create(item) {
-      const items = await this.readAll();
-      items.push(item);
-      await this.writeAll(items);
+      const db = await mongo.db();
+      // Copy so we never mutate the caller's object
+      const doc = { ...item };
+      await db.collection(collectionName).insertOne(doc);
       return item;
     },
 
     async update(id, patch) {
-      const items = await this.readAll();
-      const idx = items.findIndex(i => i.id === id);
-      if (idx === -1) return null;
-      items[idx] = patch;
-      await this.writeAll(items);
-      return items[idx];
+      const db = await mongo.db();
+      const result = await db.collection(collectionName).findOneAndUpdate(
+        { id },
+        { $set: patch },
+        { returnDocument: 'after', projection: { _id: 0 } }
+      );
+      // mongodb driver v5+ returns { value }, v6+ returns the doc directly
+      return (result && result.value) ? result.value : (result || null);
     },
 
     async remove(id) {
-      const items = await this.readAll();
-      const idx = items.findIndex(i => i.id === id);
-      if (idx === -1) return null;
-      const [removed] = items.splice(idx, 1);
-      await this.writeAll(items);
-      return removed;
+      const db = await mongo.db();
+      const result = await db.collection(collectionName).findOneAndDelete(
+        { id },
+        { projection: { _id: 0 } }
+      );
+      return (result && result.value) ? result.value : (result || null);
     },
 
     async clear() {
-      await this.writeAll([]);
+      const db = await mongo.db();
+      await db.collection(collectionName).deleteMany({});
     },
 
     async count() {
-      const items = await this.readAll();
-      return items.length;
+      const db = await mongo.db();
+      return db.collection(collectionName).countDocuments();
     }
   };
 }
 
-function createInventoryRepository(config, logger) {
-  const repo = createJsonFileRepository(config.DB_FILE, config, logger, 'inventory');
-  repo.findBySku = async function(sku, excludeId = null) {
-    const items = await this.readAll();
-    const needle = String(sku).toLowerCase();
-    return items.find(i =>
-      String(i.sku).toLowerCase() === needle && i.id !== excludeId
-    ) || null;
+function createMongoInventoryRepository(config, logger, mongo) {
+  const repo = createMongoRepository(config.INVENTORY_COLLECTION, mongo, config, logger, 'inventory');
+  repo.findBySku = async function (sku, excludeId = null) {
+    const db = await mongo.db();
+    const query = { sku: { $regex: '^' + escapeRegex(String(sku).trim()) + '$', $options: 'i' } };
+    if (excludeId) query.id = { $ne: excludeId };
+    return db.collection(config.INVENTORY_COLLECTION).findOne(query, { projection: { _id: 0 } });
   };
   return repo;
 }
 
-function createOrderRepository(config, logger) {
-  const repo = createJsonFileRepository(config.ORDERS_DB_FILE, config, logger, 'orders');
-  // Optional: enforce unique reference, if you want it later
-  repo.findByReference = async function(reference, excludeId = null) {
-    if (!reference) return null;
-    const items = await this.readAll();
-    const needle = String(reference).trim().toLowerCase();
-    return items.find(i =>
-      String(i.reference || '').trim().toLowerCase() === needle && i.id !== excludeId
-    ) || null;
+function createMongoOrderRepository(config, logger, mongo) {
+  const repo = createMongoRepository(config.ORDERS_COLLECTION, mongo, config, logger, 'orders');
+  repo.findByReference = async function (reference, excludeId = null) {
+    const ref = String(reference || '').trim();
+    if (!ref) return null;
+    const db = await mongo.db();
+    const query = { reference: { $regex: '^' + escapeRegex(ref) + '$', $options: 'i' } };
+    if (excludeId) query.id = { $ne: excludeId };
+    return db.collection(config.ORDERS_COLLECTION).findOne(query, { projection: { _id: 0 } });
   };
   return repo;
 }
 
 // ============================================================
-// 5. VALIDATION + NORMALISATION
+// 6. VALIDATION + NORMALISATION (unchanged)
 // ============================================================
 function createValidators(config) {
   const REQUIRED_FIELDS = Object.freeze(['name', 'sku', 'category', 'quantity', 'price']);
@@ -289,7 +358,6 @@ function createValidators(config) {
 
   function isValidISODate(str) {
     if (typeof str !== 'string') return false;
-    // Accept YYYY-MM-DD or full ISO
     if (!/^\d{4}-\d{2}-\d{2}/.test(str)) return false;
     const d = new Date(str);
     return !isNaN(d.getTime());
@@ -337,7 +405,7 @@ function createValidators(config) {
     return {
       customer: String(body.customer).trim(),
       status: body.status,
-      date: String(body.date).slice(0, 10),   // store YYYY-MM-DD
+      date: String(body.date).slice(0, 10),
       items: String(body.items).trim(),
       total: Number(body.total),
       reference: body.reference ? String(body.reference).trim() : '',
@@ -349,7 +417,7 @@ function createValidators(config) {
 }
 
 // ============================================================
-// 6. ERROR CLASS + ASYNC WRAPPER
+// 7. ERROR CLASS + ASYNC WRAPPER
 // ============================================================
 class HttpError extends Error {
   constructor(status, message, details = null) {
@@ -364,7 +432,7 @@ const asyncHandler = fn => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
 // ============================================================
-// 7. MIDDLEWARE FACTORIES (unchanged from your version)
+// 8. MIDDLEWARE FACTORIES (unchanged)
 // ============================================================
 function createMiddlewares(config, logger, metrics) {
   function securityHeaders() {
@@ -471,6 +539,12 @@ function createMiddlewares(config, logger, metrics) {
         if (err.details) body.details = err.details;
         return res.status(err.status).json(body);
       }
+      // Mongo duplicate-key surfaces as code 11000
+      if (err && (err.code === 11000 || err.code === 11001)) {
+        metrics.increment('http.409');
+        const field = err.keyPattern ? Object.keys(err.keyPattern)[0] : 'field';
+        return res.status(409).json({ error: `Duplicate value for "${field}"` });
+      }
       metrics.increment('http.500');
       logger.error('Unhandled error', {
         id: req.id,
@@ -494,7 +568,7 @@ function createMiddlewares(config, logger, metrics) {
 }
 
 // ============================================================
-// 8. ROUTES
+// 9. ROUTES (unchanged — repo interface is identical)
 // ============================================================
 function createInventoryRoutes({ repository, validators, logger }) {
   const { validateItem, normaliseItem } = validators;
@@ -583,25 +657,21 @@ function createOrderRoutes({ repository, validators, logger }) {
 
   const generateId = () => 'ord_' + crypto.randomBytes(8).toString('hex');
 
-  // ---- List all ----
   router.get('/', asyncHandler(async (req, res) => {
     const orders = await repository.readAll();
     res.json(orders);
   }));
 
-  // ---- Get one ----
   router.get('/:id', asyncHandler(async (req, res) => {
     const order = await repository.findById(req.params.id);
     if (!order) throw new HttpError(404, 'Order not found');
     res.json(order);
   }));
 
-  // ---- Create ----
   router.post('/', asyncHandler(async (req, res) => {
     const errors = validateOrder(req.body);
     if (errors.length) throw new HttpError(400, 'Validation failed', errors);
 
-    // Optional: enforce unique reference
     if (req.body.reference) {
       const ref = String(req.body.reference).trim();
       if (ref && await repository.findByReference(ref)) {
@@ -622,7 +692,6 @@ function createOrderRoutes({ repository, validators, logger }) {
     res.status(201).location(`/api/orders/${order.id}`).json(order);
   }));
 
-  // ---- Update ----
   router.put('/:id', asyncHandler(async (req, res) => {
     const existing = await repository.findById(req.params.id);
     if (!existing) throw new HttpError(404, 'Order not found');
@@ -651,7 +720,6 @@ function createOrderRoutes({ repository, validators, logger }) {
     res.json(updated);
   }));
 
-  // ---- Delete one ----
   router.delete('/:id', asyncHandler(async (req, res) => {
     const removed = await repository.remove(req.params.id);
     if (!removed) throw new HttpError(404, 'Order not found');
@@ -659,7 +727,6 @@ function createOrderRoutes({ repository, validators, logger }) {
     res.json({ success: true, deleted: removed.id });
   }));
 
-  // ---- Clear all ----
   router.delete('/', asyncHandler(async (req, res) => {
     await repository.clear();
     logger.warn('orders cleared', { requestId: req.id });
@@ -669,23 +736,36 @@ function createOrderRoutes({ repository, validators, logger }) {
   return router;
 }
 
-function createHealthRoutes({ inventoryRepo, orderRepo, metrics }) {
+function createHealthRoutes({ inventoryRepo, orderRepo, metrics, mongo }) {
   const router = express.Router();
 
   router.get('/', asyncHandler(async (req, res) => {
     const base = {
-      service: 'Maricopa Inventory + Orders API',
+      service: 'Maricopa Inventory + Orders API (MongoDB)',
       timestamp: new Date().toISOString()
     };
 
     try {
+      // Probe Mongo with a cheap ping so health reflects real connectivity
+      let mongoStatus = 'ok';
+      try {
+        if (mongo) {
+          const db = await mongo.db();
+          await db.command({ ping: 1 });
+        }
+      } catch (pingErr) {
+        mongoStatus = 'unreachable';
+      }
+
       const [items, orders] = await Promise.all([
         inventoryRepo.count(),
         orderRepo.count()
       ]);
+
       res.json({
         ...base,
-        status: 'ok',
+        status: mongoStatus === 'ok' ? 'ok' : 'degraded',
+        mongo: mongoStatus,
         items,
         orders,
         uptime: process.uptime(),
@@ -704,14 +784,17 @@ function createHealthRoutes({ inventoryRepo, orderRepo, metrics }) {
 }
 
 // ============================================================
-// 9. APP FACTORY
+// 10. APP FACTORY
 // ============================================================
 function createApp(options = {}) {
   const config = options.config || CONFIG;
   const logger = options.logger || createLogger(config.IS_PROD);
   const metrics = options.metrics || createMetrics();
-  const inventoryRepo = options.inventoryRepository || createInventoryRepository(config, logger);
-  const orderRepo = options.orderRepository || createOrderRepository(config, logger);
+  const mongo = options.mongo || createMongoClient(config, logger);
+  const inventoryRepo = options.inventoryRepository ||
+    createMongoInventoryRepository(config, logger, mongo);
+  const orderRepo = options.orderRepository ||
+    createMongoOrderRepository(config, logger, mongo);
   const validators = options.validators || createValidators(config);
   const middlewares = createMiddlewares(config, logger, metrics);
 
@@ -729,7 +812,7 @@ function createApp(options = {}) {
 
   // Routes
   app.use('/api/health', createHealthRoutes({
-    inventoryRepo, orderRepo, metrics
+    inventoryRepo, orderRepo, metrics, mongo
   }));
   app.use('/api/inventory', createInventoryRoutes({
     repository: inventoryRepo, validators, logger
@@ -741,13 +824,13 @@ function createApp(options = {}) {
   // Static frontend
   app.use(express.static(config.PUBLIC_DIR, { maxAge: config.IS_PROD ? '1h' : 0 }));
 
-  // SPA fallback (non-API)
+  // SPA fallback
+  const fsSync = require('fs');
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api/')) return next();
     const indexPath = path.join(config.PUBLIC_DIR, 'index.html');
-    fs.access(indexPath)
-      .then(() => res.sendFile(indexPath))
-      .catch(() => next());
+    if (fsSync.existsSync(indexPath)) return res.sendFile(indexPath);
+    next();
   });
 
   // Terminal middleware
@@ -757,6 +840,7 @@ function createApp(options = {}) {
   app.locals.config = config;
   app.locals.logger = logger;
   app.locals.metrics = metrics;
+  app.locals.mongo = mongo;
   app.locals.inventoryRepository = inventoryRepo;
   app.locals.orderRepository = orderRepo;
 
@@ -764,23 +848,28 @@ function createApp(options = {}) {
 }
 
 // ============================================================
-// 10. STARTUP / SHUTDOWN
+// 11. STARTUP / SHUTDOWN
 // ============================================================
 async function start(options = {}) {
   const config = options.config || CONFIG;
   const logger = options.logger || createLogger(config.IS_PROD);
-  const inventoryRepo = options.inventoryRepository || createInventoryRepository(config, logger);
-  const orderRepo = options.orderRepository || createOrderRepository(config, logger);
+  const mongo = options.mongo || createMongoClient(config, logger);
+  const inventoryRepo = options.inventoryRepository ||
+    createMongoInventoryRepository(config, logger, mongo);
+  const orderRepo = options.orderRepository ||
+    createMongoOrderRepository(config, logger, mongo);
 
+  // Fail fast if Mongo is unreachable
   try {
+    await mongo.db();
     await Promise.all([inventoryRepo.ensure(), orderRepo.ensure()]);
   } catch (err) {
-    logger.error('Failed to initialise data stores', { error: err.message });
+    logger.error('Failed to initialise MongoDB', { error: err.message });
     process.exit(1);
   }
 
   const app = createApp({
-    config, logger, inventoryRepository: inventoryRepo, orderRepository: orderRepo
+    config, logger, mongo, inventoryRepository: inventoryRepo, orderRepository: orderRepo
   });
 
   const server = await new Promise((resolve) => {
@@ -790,17 +879,19 @@ async function start(options = {}) {
   logger.info('Server started', {
     env: config.NODE_ENV,
     url: `http://${config.HOST}:${config.PORT}`,
-    inventoryFile: config.DB_FILE,
-    ordersFile: config.ORDERS_DB_FILE
+    mongoDb: config.MONGODB_DB,
+    inventoryCollection: config.INVENTORY_COLLECTION,
+    ordersCollection: config.ORDERS_COLLECTION
   });
 
   if (!config.IS_PROD) {
     console.log('------------------------------------------------------------');
-    console.log('  Maricopa API is ready');
+    console.log('  Maricopa API is ready (MongoDB)');
     console.log('  Dashboard:  http://localhost:' + config.PORT + '/dashboard.html');
     console.log('  Inventory:  http://localhost:' + config.PORT + '/inventory.html');
     console.log('  Orders:     http://localhost:' + config.PORT + '/orders.html');
     console.log('  Analytics:  http://localhost:' + config.PORT + '/analytics.html');
+    console.log('  Support:    http://localhost:' + config.PORT + '/support.html');
     console.log('  Health:     http://localhost:' + config.PORT + '/api/health');
     console.log('------------------------------------------------------------');
   }
@@ -821,12 +912,15 @@ async function start(options = {}) {
       server.closeIdleConnections();
     }
 
-    server.close((err) => {
+    server.close(async (err) => {
       clearTimeout(forceExit);
       if (err) {
         logger.error('Error closing server', { error: err.message });
+        // still try to close Mongo
+        try { await mongo.close(); } catch (_) {}
         return process.exit(1);
       }
+      try { await mongo.close(); } catch (_) {}
       logger.info('Server closed cleanly');
       process.exit(0);
     });
@@ -842,11 +936,11 @@ async function start(options = {}) {
     shutdown('uncaughtException');
   });
 
-  return { server, app, inventoryRepo, orderRepo, config, logger };
+  return { server, app, mongo, inventoryRepo, orderRepo, config, logger };
 }
 
 // ============================================================
-// 11. ENTRYPOINT
+// 12. ENTRYPOINT
 // ============================================================
 if (require.main === module) {
   start().catch((err) => {
@@ -859,8 +953,10 @@ module.exports = {
   loadConfig,
   createLogger,
   createMetrics,
-  createInventoryRepository,
-  createOrderRepository,
+  createMongoClient,
+  createMongoRepository,
+  createMongoInventoryRepository,
+  createMongoOrderRepository,
   createValidators,
   createMiddlewares,
   createApp,
