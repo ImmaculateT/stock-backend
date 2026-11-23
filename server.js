@@ -1,10 +1,14 @@
 // ============================================================
 // Maricopa · Inventory + Orders Management API (MongoDB)
-// server.js
+// server.js — rewritten to match home.html / inventory.html /
+//             orders.html / analytics.html contracts exactly.
 // ============================================================
 // Run with: node server.js
 // Requires: npm install express cors helmet express-rate-limit mongodb
 // Optional: npm install compression
+// Env:
+//   MONGODB_URI (required)   MONGODB_DB   PORT   NODE_ENV
+//   CORS_ORIGINS (comma-separated, or "*")
 // ============================================================
 
 'use strict';
@@ -20,7 +24,6 @@ const path = require('path');
 const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
 
-// Optional compression — gracefully skipped if not installed
 let compression = null;
 try { compression = require('compression'); } catch { /* optional */ }
 
@@ -33,9 +36,6 @@ function loadConfig(env = process.env) {
     HOST: env.HOST || '0.0.0.0',
     NODE_ENV: env.NODE_ENV || 'development',
 
-    // ---- MongoDB ----
-    // Set MONGODB_URI in Render environment variables.
-    // Never hardcode database credentials in this file.
     MONGODB_URI: env.MONGODB_URI || '',
     MONGODB_DB: env.MONGODB_DB || 'maricopa',
     INVENTORY_COLLECTION: env.INVENTORY_COLLECTION || 'inventory',
@@ -65,19 +65,15 @@ function loadConfig(env = process.env) {
 
   cfg.IS_PROD = cfg.NODE_ENV === 'production';
 
-  // Fail-fast validation
   if (!Number.isFinite(cfg.PORT) || cfg.PORT <= 0 || cfg.PORT > 65535) {
     throw new Error(`Invalid PORT: ${env.PORT}`);
   }
-
   if (!Number.isFinite(cfg.SHUTDOWN_TIMEOUT_MS) || cfg.SHUTDOWN_TIMEOUT_MS < 1000) {
     throw new Error('SHUTDOWN_TIMEOUT_MS must be >= 1000');
   }
-
   if (!cfg.MONGODB_URI) {
     throw new Error('MONGODB_URI is required. Set it in your environment variables.');
   }
-
   if (!/^mongodb(\+srv)?:\/\//.test(cfg.MONGODB_URI)) {
     throw new Error('MONGODB_URI must start with mongodb:// or mongodb+srv://');
   }
@@ -93,22 +89,18 @@ const CONFIG = loadConfig();
 function createLogger(isProd) {
   const write = (level, msg, meta = {}) => {
     const entry = { ts: new Date().toISOString(), level, msg, ...meta };
-
     const line = isProd
       ? JSON.stringify(entry)
       : `[${entry.ts}] ${level.toUpperCase()} ${msg}` +
         (Object.keys(meta).length ? ' ' + JSON.stringify(meta) : '');
-
     (level === 'error' ? console.error : console.log)(line);
   };
 
   return {
-    info: (msg, meta) => write('info', msg, meta),
-    warn: (msg, meta) => write('warn', msg, meta),
+    info:  (msg, meta) => write('info',  msg, meta),
+    warn:  (msg, meta) => write('warn',  msg, meta),
     error: (msg, meta) => write('error', msg, meta),
-    debug: (msg, meta) => {
-      if (!isProd) write('debug', msg, meta);
-    }
+    debug: (msg, meta) => { if (!isProd) write('debug', msg, meta); }
   };
 }
 
@@ -116,24 +108,15 @@ function createMetrics() {
   const counters = new Map();
   const histograms = new Map();
 
-  const bump = (key, by = 1) => {
-    counters.set(key, (counters.get(key) || 0) + by);
-  };
+  const bump = (key, by = 1) => counters.set(key, (counters.get(key) || 0) + by);
 
   const record = (key, value) => {
     if (!histograms.has(key)) {
-      histograms.set(key, {
-        count: 0,
-        sum: 0,
-        min: Infinity,
-        max: -Infinity
-      });
+      histograms.set(key, { count: 0, sum: 0, min: Infinity, max: -Infinity });
     }
-
     const h = histograms.get(key);
     h.count += 1;
     h.sum += value;
-
     if (value < h.min) h.min = value;
     if (value > h.max) h.max = value;
   };
@@ -141,10 +124,8 @@ function createMetrics() {
   return {
     increment: bump,
     observe: record,
-
     snapshot: () => ({
       counters: Object.fromEntries(counters),
-
       histograms: Object.fromEntries(
         [...histograms.entries()].map(([k, h]) => [
           k,
@@ -161,7 +142,7 @@ function createMetrics() {
 }
 
 // ============================================================
-// 4. MONGODB CLIENT — shared, lazy-connect, auto-reconnect
+// 4. MONGODB CLIENT
 // ============================================================
 function createMongoClient(config, logger) {
   const client = new MongoClient(config.MONGODB_URI, {
@@ -175,13 +156,11 @@ function createMongoClient(config, logger) {
 
   async function getClient() {
     if (closed) throw new Error('Mongo client is closed');
-
     if (!connectPromise) {
       connectPromise = client.connect()
         .then(() => {
           logger.info('MongoDB connected', {
             db: config.MONGODB_DB,
-
             host: (() => {
               try {
                 return new URL(
@@ -189,25 +168,17 @@ function createMongoClient(config, logger) {
                     .replace('mongodb+srv://', 'https://')
                     .replace('mongodb://', 'http://')
                 ).host;
-              } catch {
-                return 'unknown';
-              }
+              } catch { return 'unknown'; }
             })()
           });
-
           return client;
         })
         .catch(err => {
           connectPromise = null;
-
-          logger.error('MongoDB connection failed', {
-            error: err.message
-          });
-
+          logger.error('MongoDB connection failed', { error: err.message });
           throw err;
         });
     }
-
     return connectPromise;
   }
 
@@ -216,22 +187,16 @@ function createMongoClient(config, logger) {
       const c = await getClient();
       return c.db(config.MONGODB_DB);
     },
-
     async close() {
       closed = true;
-      try {
-        await client.close();
-      } catch (_) {
-        /* ignore */
-      }
+      try { await client.close(); } catch (_) { /* ignore */ }
     },
-
     raw: client
   };
 }
 
 // ============================================================
-// 5. MONGODB REPOSITORIES
+// 5. MONGODB REPOSITORY
 // ============================================================
 function escapeRegex(str) {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -244,7 +209,6 @@ function createMongoRepository(collectionName, mongo, config, logger, label) {
         const db = await mongo.db();
         const coll = db.collection(collectionName);
 
-        // Indexes — safe to create every boot (idempotent)
         if (label === 'inventory') {
           await coll.createIndex({ sku: 1 }, { unique: true });
           await coll.createIndex({ name: 1 });
@@ -252,42 +216,32 @@ function createMongoRepository(collectionName, mongo, config, logger, label) {
         }
 
         if (label === 'orders') {
-          // MongoDB does not allow sparse and partialFilterExpression together.
-          // This unique partial index applies only to non-empty string references.
+          // Unique reference only when non-empty string (frontend sends "" when blank)
           await coll.createIndex(
             { reference: 1 },
             {
               unique: true,
               name: 'reference_1',
-              partialFilterExpression: {
-                reference: { $type: 'string', $gt: '' }
-              }
+              partialFilterExpression: { reference: { $type: 'string', $gt: '' } }
             }
           );
-
           await coll.createIndex({ status: 1 });
           await coll.createIndex({ date: -1 });
+          await coll.createIndex({ customer: 1 });
         }
 
         await coll.createIndex({ id: 1 }, { unique: true });
         await coll.createIndex({ createdAt: -1 });
 
-        logger.info(`MongoDB ${label} collection ready`, {
-          collection: collectionName
-        });
-
+        logger.info(`MongoDB ${label} collection ready`, { collection: collectionName });
       } catch (err) {
-        logger.error(`MongoDB ${label} ensure() failed`, {
-          error: err.message
-        });
-
+        logger.error(`MongoDB ${label} ensure() failed`, { error: err.message });
         throw err;
       }
     },
 
     async readAll() {
       const db = await mongo.db();
-
       return db.collection(collectionName)
         .find({}, { projection: { _id: 0 } })
         .sort({ createdAt: -1 })
@@ -296,126 +250,81 @@ function createMongoRepository(collectionName, mongo, config, logger, label) {
 
     async findById(id) {
       const db = await mongo.db();
-
-      return db.collection(collectionName).findOne(
-        { id },
-        { projection: { _id: 0 } }
-      );
+      return db.collection(collectionName).findOne({ id }, { projection: { _id: 0 } });
     },
 
     async create(item) {
       const db = await mongo.db();
-
-      // Copy so we never mutate the caller's object
       const doc = { ...item };
-
       await db.collection(collectionName).insertOne(doc);
-
       return item;
     },
 
     async update(id, patch) {
       const db = await mongo.db();
-
       const result = await db.collection(collectionName).findOneAndUpdate(
         { id },
         { $set: patch },
-        {
-          returnDocument: 'after',
-          projection: { _id: 0 }
-        }
+        { returnDocument: 'after', projection: { _id: 0 } }
       );
-
-      // mongodb driver v5+ returns { value }, v6+ returns the doc directly
-      return (result && result.value)
-        ? result.value
-        : (result || null);
+      return (result && result.value) ? result.value : (result || null);
     },
 
     async remove(id) {
       const db = await mongo.db();
-
       const result = await db.collection(collectionName).findOneAndDelete(
         { id },
         { projection: { _id: 0 } }
       );
-
-      return (result && result.value)
-        ? result.value
-        : (result || null);
+      return (result && result.value) ? result.value : (result || null);
     },
 
     async clear() {
       const db = await mongo.db();
-
       await db.collection(collectionName).deleteMany({});
     },
 
     async count() {
       const db = await mongo.db();
-
       return db.collection(collectionName).countDocuments();
     }
   };
 }
 
 // ============================================================
-// 6. IN-MEMORY REPOSITORY
+// 6. IN-MEMORY REPOSITORY (fallback)
 // ============================================================
 function createMemoryRepository(label, logger) {
   const items = new Map();
 
   return {
-    async ensure() {
-      logger.info(`Memory ${label} repository ready`);
-    },
-
+    async ensure() { logger.info(`Memory ${label} repository ready`); },
     async readAll() {
       return [...items.values()].sort(
         (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
       );
     },
-
-    async findById(id) {
-      return items.get(id) || null;
-    },
-
+    async findById(id) { return items.get(id) || null; },
     async create(item) {
-      if (items.has(item.id)) {
-        throw new Error(`${label} item already exists`);
-      }
-
+      if (items.has(item.id)) throw new Error(`${label} item already exists`);
       items.set(item.id, { ...item });
       return item;
     },
-
     async update(id, patch) {
       const existing = items.get(id);
-
       if (!existing) return null;
-
       const updated = { ...existing, ...patch };
       items.set(id, updated);
-
       return updated;
     },
-
     async remove(id) {
       const existing = items.get(id);
-
       if (!existing) return null;
-
       items.delete(id);
       return existing;
     },
-
-    async clear() {
-      items.clear();
-    },
-
-    async count() {
-      return items.size;
-    }
+    async clear() { items.clear(); },
+    async count() { return items.size; }
   };
 }
 
@@ -428,14 +337,16 @@ function isObject(value) {
 
 function cleanString(value, maxLength = 200) {
   if (typeof value !== 'string') return '';
-
   return value.trim().slice(0, maxLength);
 }
 
 function toNumber(value, fallback = 0) {
   const number = Number(value);
-
   return Number.isFinite(number) ? number : fallback;
+}
+
+function isValidDateString(s) {
+  return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
 function makeId() {
@@ -444,175 +355,21 @@ function makeId() {
 
 function makeReference() {
   const date = new Date();
-
   const year = date.getFullYear().toString().slice(-2);
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
-
   const random = crypto.randomBytes(3).toString('hex').toUpperCase();
-
   return `MAR-${year}${month}${day}-${random}`;
 }
 
 // ============================================================
-// 8. APPLICATION FACTORY
+// 8. ROUTERS — mounted at both /api/* and /
 // ============================================================
-function createApp(config = CONFIG) {
-  const logger = createLogger(config.IS_PROD);
-  const metrics = createMetrics();
+function buildInventoryRouter({ inventoryRepo, config, logger }) {
+  const router = express.Router();
 
-  const mongo = createMongoClient(config, logger);
-
-  const inventoryRepo = createMongoRepository(
-    config.INVENTORY_COLLECTION,
-    mongo,
-    config,
-    logger,
-    'inventory'
-  );
-
-  const ordersRepo = createMongoRepository(
-    config.ORDERS_COLLECTION,
-    mongo,
-    config,
-    logger,
-    'orders'
-  );
-
-  const app = express();
-
-  // ==========================================================
-  // MIDDLEWARE
-  // ==========================================================
-  app.disable('x-powered-by');
-
-  app.set('trust proxy', 1);
-
-  app.use(helmet({
-    crossOriginResourcePolicy: { policy: 'cross-origin' }
-  }));
-
-  app.use(cors({
-    origin: config.CORS_ORIGINS.includes('*')
-      ? '*'
-      : config.CORS_ORIGINS,
-
-    credentials: !config.CORS_ORIGINS.includes('*')
-  }));
-
-  if (compression) {
-    app.use(compression());
-  }
-
-  app.use(express.json({
-    limit: config.BODY_LIMIT
-  }));
-
-  app.use(express.urlencoded({
-    extended: true,
-    limit: config.BODY_LIMIT
-  }));
-
-  const limiter = rateLimit({
-    windowMs: config.RATE_LIMIT_WINDOW_MS,
-
-    max: config.IS_PROD
-      ? config.RATE_LIMIT_MAX_PROD
-      : config.RATE_LIMIT_MAX_DEV,
-
-    standardHeaders: true,
-    legacyHeaders: false,
-
-    message: {
-      success: false,
-      message: 'Too many requests. Please try again later.'
-    }
-  });
-
-  app.use('/api', limiter);
-
-  // ==========================================================
-  // REQUEST METRICS
-  // ==========================================================
-  app.use((req, res, next) => {
-    const started = Date.now();
-
-    res.on('finish', () => {
-      const duration = Date.now() - started;
-
-      metrics.increment(`${req.method} ${req.route?.path || req.path}`);
-      metrics.observe('request_duration_ms', duration);
-
-      logger.debug('Request completed', {
-        method: req.method,
-        path: req.path,
-        status: res.statusCode,
-        duration
-      });
-    });
-
-    next();
-  });
-
-  // ==========================================================
-  // HEALTH CHECK
-  // ==========================================================
-  app.get('/health', async (req, res) => {
-    try {
-      const db = await mongo.db();
-      await db.command({ ping: 1 });
-
-      res.json({
-        success: true,
-        status: 'healthy',
-        database: 'connected',
-        timestamp: new Date().toISOString()
-      });
-
-    } catch (err) {
-      logger.error('Health check failed', {
-        error: err.message
-      });
-
-      res.status(503).json({
-        success: false,
-        status: 'unhealthy',
-        database: 'disconnected'
-      });
-    }
-  });
-
-  // ==========================================================
-  // API ROOT
-  // ==========================================================
-  app.get('/api', (req, res) => {
-    res.json({
-      success: true,
-      message: 'Maricopa Inventory and Orders API',
-      version: '1.0.0',
-      endpoints: {
-        health: '/health',
-        inventory: '/api/inventory',
-        orders: '/api/orders',
-        metrics: '/api/metrics'
-      }
-    });
-  });
-
-  // ==========================================================
-  // METRICS
-  // ==========================================================
-  app.get('/api/metrics', (req, res) => {
-    res.json({
-      success: true,
-      metrics: metrics.snapshot()
-    });
-  });
-
-  // ==========================================================
-  // INVENTORY ROUTES
-  // ==========================================================
-  app.get('/api/inventory', async (req, res, next) => {
+  // GET /inventory  — frontend expects a bare array
+  router.get('/', async (req, res, next) => {
     try {
       let items = await inventoryRepo.readAll();
 
@@ -623,73 +380,49 @@ function createApp(config = CONFIG) {
         items = items.filter(item =>
           String(item.name || '').toLowerCase().includes(search) ||
           String(item.sku || '').toLowerCase().includes(search) ||
-          String(item.description || '').toLowerCase().includes(search)
+          String(item.description || '').toLowerCase().includes(search) ||
+          String(item.supplier || '').toLowerCase().includes(search)
         );
       }
-
       if (category) {
         items = items.filter(item => item.category === category);
       }
 
-      res.json({
-        success: true,
-        count: items.length,
-        data: items
-      });
-
-    } catch (err) {
-      next(err);
-    }
+      // IMPORTANT: bare array — matches frontend `Array.isArray(data)`
+      res.json(items);
+    } catch (err) { next(err); }
   });
 
-  app.get('/api/inventory/:id', async (req, res, next) => {
+  // GET /inventory/:id (bonus — not used by frontend, harmless)
+  router.get('/:id', async (req, res, next) => {
     try {
       const item = await inventoryRepo.findById(req.params.id);
-
-      if (!item) {
-        return res.status(404).json({
-          success: false,
-          message: 'Inventory item not found'
-        });
-      }
-
-      res.json({
-        success: true,
-        data: item
-      });
-
-    } catch (err) {
-      next(err);
-    }
+      if (!item) return res.status(404).json({ error: 'Inventory item not found' });
+      res.json(item);
+    } catch (err) { next(err); }
   });
 
-  app.post('/api/inventory', async (req, res, next) => {
+  // POST /inventory
+  router.post('/', async (req, res, next) => {
     try {
       const body = req.body;
-
       if (!isObject(body)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid request body'
-        });
+        return res.status(400).json({ error: 'Invalid request body', details: ['Body must be a JSON object'] });
       }
 
       const name = cleanString(body.name, 150);
       const sku = cleanString(body.sku, 80);
       const category = cleanString(body.category, 80);
 
-      if (!name || !sku || !category) {
-        return res.status(400).json({
-          success: false,
-          message: 'Name, SKU and category are required'
-        });
+      const errors = [];
+      if (!name) errors.push('name is required');
+      if (!sku) errors.push('sku is required');
+      if (!category) errors.push('category is required');
+      if (category && !config.VALID_CATEGORIES.includes(category)) {
+        errors.push(`category must be one of: ${config.VALID_CATEGORIES.join(', ')}`);
       }
-
-      if (!config.VALID_CATEGORIES.includes(category)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid inventory category'
-        });
+      if (errors.length) {
+        return res.status(400).json({ error: 'Validation failed', details: errors });
       }
 
       const item = {
@@ -699,485 +432,474 @@ function createApp(config = CONFIG) {
         category,
         description: cleanString(body.description, 1000),
         quantity: Math.max(0, toNumber(body.quantity)),
-        unit: cleanString(body.unit, 40),
+        unit: cleanString(body.unit, 40) || 'units',
         price: Math.max(0, toNumber(body.price)),
+        threshold: Math.max(0, toNumber(body.threshold, 10)),
         supplier: cleanString(body.supplier, 150),
         location: cleanString(body.location, 150),
+        notes: cleanString(body.notes, 1000),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
 
       await inventoryRepo.create(item);
-
-      res.status(201).json({
-        success: true,
-        message: 'Inventory item created successfully',
-        data: item
-      });
-
+      res.status(201).json(item);
     } catch (err) {
       if (err.code === 11000) {
         return res.status(409).json({
-          success: false,
-          message: 'An inventory item with this SKU or ID already exists'
+          error: `SKU "${cleanString(req.body.sku, 80)}" already exists`,
+          details: ['sku must be unique']
         });
       }
-
       next(err);
     }
   });
 
-  app.put('/api/inventory/:id', async (req, res, next) => {
+  // PUT /inventory/:id
+  router.put('/:id', async (req, res, next) => {
     try {
       const body = req.body;
-
       if (!isObject(body)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid request body'
-        });
+        return res.status(400).json({ error: 'Invalid request body', details: ['Body must be a JSON object'] });
       }
 
       const patch = {};
-
       const allowedFields = [
-        'name',
-        'sku',
-        'category',
-        'description',
-        'quantity',
-        'unit',
-        'price',
-        'supplier',
-        'location'
+        'name', 'sku', 'category', 'description',
+        'quantity', 'unit', 'price', 'threshold',
+        'supplier', 'location', 'notes'
       ];
-
       for (const field of allowedFields) {
-        if (body[field] !== undefined) {
-          patch[field] = body[field];
-        }
+        if (body[field] !== undefined) patch[field] = body[field];
       }
 
-      if (patch.name !== undefined) {
-        patch.name = cleanString(patch.name, 150);
-      }
-
-      if (patch.sku !== undefined) {
-        patch.sku = cleanString(patch.sku, 80);
-      }
-
+      if (patch.name !== undefined) patch.name = cleanString(patch.name, 150);
+      if (patch.sku !== undefined) patch.sku = cleanString(patch.sku, 80);
       if (patch.category !== undefined) {
         patch.category = cleanString(patch.category, 80);
-
         if (!config.VALID_CATEGORIES.includes(patch.category)) {
           return res.status(400).json({
-            success: false,
-            message: 'Invalid inventory category'
+            error: 'Invalid category',
+            details: [`category must be one of: ${config.VALID_CATEGORIES.join(', ')}`]
           });
         }
       }
-
-      if (patch.description !== undefined) {
-        patch.description = cleanString(patch.description, 1000);
-      }
-
-      if (patch.quantity !== undefined) {
-        patch.quantity = Math.max(0, toNumber(patch.quantity));
-      }
-
-      if (patch.price !== undefined) {
-        patch.price = Math.max(0, toNumber(patch.price));
-      }
-
-      if (patch.unit !== undefined) {
-        patch.unit = cleanString(patch.unit, 40);
-      }
-
-      if (patch.supplier !== undefined) {
-        patch.supplier = cleanString(patch.supplier, 150);
-      }
-
-      if (patch.location !== undefined) {
-        patch.location = cleanString(patch.location, 150);
-      }
+      if (patch.description !== undefined) patch.description = cleanString(patch.description, 1000);
+      if (patch.quantity !== undefined) patch.quantity = Math.max(0, toNumber(patch.quantity));
+      if (patch.price !== undefined) patch.price = Math.max(0, toNumber(patch.price));
+      if (patch.threshold !== undefined) patch.threshold = Math.max(0, toNumber(patch.threshold, 10));
+      if (patch.unit !== undefined) patch.unit = cleanString(patch.unit, 40) || 'units';
+      if (patch.supplier !== undefined) patch.supplier = cleanString(patch.supplier, 150);
+      if (patch.location !== undefined) patch.location = cleanString(patch.location, 150);
+      if (patch.notes !== undefined) patch.notes = cleanString(patch.notes, 1000);
 
       patch.updatedAt = new Date().toISOString();
 
       const updated = await inventoryRepo.update(req.params.id, patch);
-
-      if (!updated) {
-        return res.status(404).json({
-          success: false,
-          message: 'Inventory item not found'
-        });
-      }
-
-      res.json({
-        success: true,
-        message: 'Inventory item updated successfully',
-        data: updated
-      });
-
+      if (!updated) return res.status(404).json({ error: 'Inventory item not found' });
+      res.json(updated);
     } catch (err) {
       if (err.code === 11000) {
         return res.status(409).json({
-          success: false,
-          message: 'An inventory item with this SKU or ID already exists'
+          error: 'SKU already exists',
+          details: ['sku must be unique']
         });
       }
-
       next(err);
     }
   });
 
-  app.delete('/api/inventory/:id', async (req, res, next) => {
+  // DELETE /inventory  — clear all. MUST be registered before '/:id'.
+  router.delete('/', async (req, res, next) => {
+    try {
+      await inventoryRepo.clear();
+      res.status(204).end();
+    } catch (err) { next(err); }
+  });
+
+  // DELETE /inventory/:id
+  router.delete('/:id', async (req, res, next) => {
     try {
       const deleted = await inventoryRepo.remove(req.params.id);
-
-      if (!deleted) {
-        return res.status(404).json({
-          success: false,
-          message: 'Inventory item not found'
-        });
-      }
-
-      res.json({
-        success: true,
-        message: 'Inventory item deleted successfully',
-        data: deleted
-      });
-
-    } catch (err) {
-      next(err);
-    }
+      if (!deleted) return res.status(404).json({ error: 'Inventory item not found' });
+      res.json(deleted);
+    } catch (err) { next(err); }
   });
 
-  // ==========================================================
-  // ORDERS ROUTES
-  // ==========================================================
-  app.get('/api/orders', async (req, res, next) => {
+  return router;
+}
+
+function buildOrdersRouter({ ordersRepo, config, logger }) {
+  const router = express.Router();
+
+  // GET /orders — bare array
+  router.get('/', async (req, res, next) => {
     try {
       let orders = await ordersRepo.readAll();
-
       const status = cleanString(req.query.status, 50);
       const search = cleanString(req.query.search, 100).toLowerCase();
 
-      if (status) {
-        orders = orders.filter(order => order.status === status);
-      }
-
+      if (status) orders = orders.filter(o => o.status === status);
       if (search) {
-        orders = orders.filter(order =>
-          String(order.reference || '').toLowerCase().includes(search) ||
-          String(order.customerName || '').toLowerCase().includes(search) ||
-          String(order.customerEmail || '').toLowerCase().includes(search)
+        orders = orders.filter(o =>
+          String(o.id || '').toLowerCase().includes(search) ||
+          String(o.customer || '').toLowerCase().includes(search) ||
+          String(o.items || '').toLowerCase().includes(search) ||
+          String(o.reference || '').toLowerCase().includes(search)
         );
       }
-
-      res.json({
-        success: true,
-        count: orders.length,
-        data: orders
-      });
-
-    } catch (err) {
-      next(err);
-    }
+      res.json(orders);
+    } catch (err) { next(err); }
   });
 
-  app.get('/api/orders/:id', async (req, res, next) => {
+  // GET /orders/:id (bonus)
+  router.get('/:id', async (req, res, next) => {
     try {
       const order = await ordersRepo.findById(req.params.id);
-
-      if (!order) {
-        return res.status(404).json({
-          success: false,
-          message: 'Order not found'
-        });
-      }
-
-      res.json({
-        success: true,
-        data: order
-      });
-
-    } catch (err) {
-      next(err);
-    }
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      res.json(order);
+    } catch (err) { next(err); }
   });
 
-  app.post('/api/orders', async (req, res, next) => {
+  // POST /orders — accept the frontend's exact shape
+  router.post('/', async (req, res, next) => {
     try {
       const body = req.body;
-
       if (!isObject(body)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid request body'
-        });
+        return res.status(400).json({ error: 'Invalid request body', details: ['Body must be a JSON object'] });
       }
 
-      const customerName = cleanString(body.customerName, 150);
-      const customerEmail = cleanString(body.customerEmail, 150);
+      const errors = [];
 
-      if (!customerName || !customerEmail) {
-        return res.status(400).json({
-          success: false,
-          message: 'Customer name and email are required'
-        });
+      const customer = cleanString(body.customer, 150);
+      if (!customer) errors.push('customer is required');
+
+      const status = cleanString(body.status, 50) || 'pending';
+      if (!config.VALID_ORDER_STATUSES.includes(status)) {
+        errors.push(`status must be one of: ${config.VALID_ORDER_STATUSES.join(', ')}`);
       }
 
-      const products = Array.isArray(body.products)
-        ? body.products
-        : [];
+      const date = cleanString(body.date, 10);
+      if (!date) errors.push('date is required');
+      else if (!isValidDateString(date)) errors.push('date must be YYYY-MM-DD');
 
-      if (!products.length) {
-        return res.status(400).json({
-          success: false,
-          message: 'At least one product is required'
-        });
+      const items = cleanString(body.items, 1000);
+      if (!items) errors.push('items is required');
+
+      if (body.total === undefined || body.total === null || body.total === '') {
+        errors.push('total is required');
       }
+      const total = toNumber(body.total, NaN);
+      if (!Number.isFinite(total) || total < 0) errors.push('total must be a number >= 0');
 
-      const cleanProducts = products.map(product => ({
-        id: cleanString(product.id, 100),
-        name: cleanString(product.name, 150),
-        quantity: Math.max(1, toNumber(product.quantity, 1)),
-        price: Math.max(0, toNumber(product.price))
-      }));
+      // reference is optional; auto-generate if blank
+      let reference = cleanString(body.reference, 100);
+      if (!reference) reference = makeReference();
 
-      const total = cleanProducts.reduce(
-        (sum, product) => sum + product.quantity * product.price,
-        0
-      );
+      if (errors.length) {
+        return res.status(400).json({ error: 'Validation failed', details: errors });
+      }
 
       const order = {
         id: makeId(),
-        reference: makeReference(),
-        customerName,
-        customerEmail,
-        customerPhone: cleanString(body.customerPhone, 50),
-        deliveryAddress: cleanString(body.deliveryAddress, 500),
-        products: cleanProducts,
+        customer,
+        status,
+        date,
+        items,
         total,
-        status: 'pending',
+        reference,
         notes: cleanString(body.notes, 1000),
-        date: new Date().toISOString(),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
 
       await ordersRepo.create(order);
-
-      res.status(201).json({
-        success: true,
-        message: 'Order created successfully',
-        data: order
-      });
-
+      res.status(201).json(order);
     } catch (err) {
       if (err.code === 11000) {
         return res.status(409).json({
-          success: false,
-          message: 'An order with this reference or ID already exists'
+          error: 'An order with this reference already exists',
+          details: ['reference must be unique']
         });
       }
-
       next(err);
     }
   });
 
-  app.patch('/api/orders/:id/status', async (req, res, next) => {
-    try {
-      const status = cleanString(req.body.status, 50);
-
-      if (!config.VALID_ORDER_STATUSES.includes(status)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid order status',
-          allowedStatuses: config.VALID_ORDER_STATUSES
-        });
-      }
-
-      const updated = await ordersRepo.update(req.params.id, {
-        status,
-        updatedAt: new Date().toISOString()
-      });
-
-      if (!updated) {
-        return res.status(404).json({
-          success: false,
-          message: 'Order not found'
-        });
-      }
-
-      res.json({
-        success: true,
-        message: 'Order status updated successfully',
-        data: updated
-      });
-
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  app.put('/api/orders/:id', async (req, res, next) => {
+  // PUT /orders/:id — allow all frontend-editable fields
+  router.put('/:id', async (req, res, next) => {
     try {
       const body = req.body;
-
       if (!isObject(body)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid request body'
-        });
+        return res.status(400).json({ error: 'Invalid request body', details: ['Body must be a JSON object'] });
       }
 
       const patch = {};
 
+      if (body.customer !== undefined) {
+        const customer = cleanString(body.customer, 150);
+        if (!customer) {
+          return res.status(400).json({ error: 'Validation failed', details: ['customer cannot be empty'] });
+        }
+        patch.customer = customer;
+      }
+
       if (body.status !== undefined) {
         const status = cleanString(body.status, 50);
-
         if (!config.VALID_ORDER_STATUSES.includes(status)) {
           return res.status(400).json({
-            success: false,
-            message: 'Invalid order status'
+            error: 'Invalid order status',
+            details: [`status must be one of: ${config.VALID_ORDER_STATUSES.join(', ')}`]
           });
         }
-
         patch.status = status;
+      }
+
+      if (body.date !== undefined) {
+        const date = cleanString(body.date, 10);
+        if (!isValidDateString(date)) {
+          return res.status(400).json({ error: 'Invalid date', details: ['date must be YYYY-MM-DD'] });
+        }
+        patch.date = date;
+      }
+
+      if (body.items !== undefined) {
+        const items = cleanString(body.items, 1000);
+        if (!items) {
+          return res.status(400).json({ error: 'Validation failed', details: ['items cannot be empty'] });
+        }
+        patch.items = items;
+      }
+
+      if (body.total !== undefined) {
+        const total = toNumber(body.total, NaN);
+        if (!Number.isFinite(total) || total < 0) {
+          return res.status(400).json({ error: 'Invalid total', details: ['total must be a number >= 0'] });
+        }
+        patch.total = total;
+      }
+
+      if (body.reference !== undefined) {
+        patch.reference = cleanString(body.reference, 100);
       }
 
       if (body.notes !== undefined) {
         patch.notes = cleanString(body.notes, 1000);
       }
 
-      if (body.deliveryAddress !== undefined) {
-        patch.deliveryAddress = cleanString(body.deliveryAddress, 500);
-      }
-
       patch.updatedAt = new Date().toISOString();
 
       const updated = await ordersRepo.update(req.params.id, patch);
-
-      if (!updated) {
-        return res.status(404).json({
-          success: false,
-          message: 'Order not found'
+      if (!updated) return res.status(404).json({ error: 'Order not found' });
+      res.json(updated);
+    } catch (err) {
+      if (err.code === 11000) {
+        return res.status(409).json({
+          error: 'An order with this reference already exists',
+          details: ['reference must be unique']
         });
       }
-
-      res.json({
-        success: true,
-        message: 'Order updated successfully',
-        data: updated
-      });
-
-    } catch (err) {
       next(err);
     }
   });
 
-  app.delete('/api/orders/:id', async (req, res, next) => {
+  // DELETE /orders — clear all. MUST be registered before '/:id'.
+  router.delete('/', async (req, res, next) => {
+    try {
+      await ordersRepo.clear();
+      res.status(204).end();
+    } catch (err) { next(err); }
+  });
+
+  // DELETE /orders/:id
+  router.delete('/:id', async (req, res, next) => {
     try {
       const deleted = await ordersRepo.remove(req.params.id);
+      if (!deleted) return res.status(404).json({ error: 'Order not found' });
+      res.json(deleted);
+    } catch (err) { next(err); }
+  });
 
-      if (!deleted) {
-        return res.status(404).json({
-          success: false,
-          message: 'Order not found'
+  // PATCH /orders/:id/status (bonus — not used by frontend)
+  router.patch('/:id/status', async (req, res, next) => {
+    try {
+      const status = cleanString(req.body && req.body.status, 50);
+      if (!config.VALID_ORDER_STATUSES.includes(status)) {
+        return res.status(400).json({
+          error: 'Invalid order status',
+          details: [`status must be one of: ${config.VALID_ORDER_STATUSES.join(', ')}`]
         });
       }
-
-      res.json({
-        success: true,
-        message: 'Order deleted successfully',
-        data: deleted
+      const updated = await ordersRepo.update(req.params.id, {
+        status,
+        updatedAt: new Date().toISOString()
       });
-
-    } catch (err) {
-      next(err);
-    }
+      if (!updated) return res.status(404).json({ error: 'Order not found' });
+      res.json(updated);
+    } catch (err) { next(err); }
   });
 
-  // ==========================================================
-  // STATIC FILES
-  // ==========================================================
-  app.use(express.static(config.PUBLIC_DIR));
+  return router;
+}
 
-  app.get('/', (req, res) => {
-    res.sendFile(path.join(config.PUBLIC_DIR, 'index.html'), err => {
-      if (err) {
-        res.status(200).send(
-          'Maricopa Inventory and Orders API is running.'
-        );
+// ============================================================
+// 9. APPLICATION FACTORY
+// ============================================================
+function createApp(config = CONFIG) {
+  const logger = createLogger(config.IS_PROD);
+  const metrics = createMetrics();
+  const mongo = createMongoClient(config, logger);
+
+  const inventoryRepo = createMongoRepository(
+    config.INVENTORY_COLLECTION, mongo, config, logger, 'inventory'
+  );
+  const ordersRepo = createMongoRepository(
+    config.ORDERS_COLLECTION, mongo, config, logger, 'orders'
+  );
+
+  const app = express();
+
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+
+  app.use(helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' }
+  }));
+
+  app.use(cors({
+    origin: config.CORS_ORIGINS.includes('*') ? '*' : config.CORS_ORIGINS,
+    credentials: !config.CORS_ORIGINS.includes('*')
+  }));
+
+  if (compression) app.use(compression());
+
+  app.use(express.json({ limit: config.BODY_LIMIT }));
+  app.use(express.urlencoded({ extended: true, limit: config.BODY_LIMIT }));
+
+  // Request metrics
+  app.use((req, res, next) => {
+    const started = Date.now();
+    res.on('finish', () => {
+      const duration = Date.now() - started;
+      metrics.increment(`${req.method} ${req.route?.path || req.path}`);
+      metrics.observe('request_duration_ms', duration);
+      logger.debug('Request completed', {
+        method: req.method, path: req.path,
+        status: res.statusCode, duration
+      });
+    });
+    next();
+  });
+
+  // Rate limit — apply only to the API namespaces
+  const limiter = rateLimit({
+    windowMs: config.RATE_LIMIT_WINDOW_MS,
+    max: config.IS_PROD ? config.RATE_LIMIT_MAX_PROD : config.RATE_LIMIT_MAX_DEV,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests. Please try again later.' }
+  });
+  app.use('/api', limiter);
+
+  // Health check (kept exactly as before, also works at root)
+  const healthHandler = async (req, res) => {
+    try {
+      const db = await mongo.db();
+      await db.command({ ping: 1 });
+      res.json({
+        success: true,
+        status: 'healthy',
+        database: 'connected',
+        timestamp: new Date().toISOString()
+      });
+    } catch (err) {
+      logger.error('Health check failed', { error: err.message });
+      res.status(503).json({
+        success: false,
+        status: 'unhealthy',
+        database: 'disconnected'
+      });
+    }
+  };
+  app.get('/health', healthHandler);
+
+  // API root
+  app.get('/api', (req, res) => {
+    res.json({
+      success: true,
+      message: 'Maricopa Inventory and Orders API',
+      version: '1.0.0',
+      endpoints: {
+        health: '/health',
+        inventory: '/inventory',
+        orders: '/orders',
+        metrics: '/api/metrics'
       }
     });
   });
 
-  // ==========================================================
-  // 404 HANDLER
-  // ==========================================================
-  app.use((req, res) => {
-    res.status(404).json({
-      success: false,
-      message: 'Route not found',
-      path: req.originalUrl
+  // Metrics
+  app.get('/api/metrics', (req, res) => {
+    res.json({ success: true, metrics: metrics.snapshot() });
+  });
+
+  // Build routers once, mount twice
+  const inventoryRouter = buildInventoryRouter({ inventoryRepo, config, logger });
+  const ordersRouter = buildOrdersRouter({ ordersRepo, config, logger });
+
+  // Canonical namespace
+  app.use('/api/inventory', inventoryRouter);
+  app.use('/api/orders', ordersRouter);
+
+  // Bare paths — what the frontends actually call
+  app.use('/inventory', inventoryRouter);
+  app.use('/orders', ordersRouter);
+
+  // Static files
+  app.use(express.static(config.PUBLIC_DIR));
+  app.get('/', (req, res) => {
+    res.sendFile(path.join(config.PUBLIC_DIR, 'index.html'), err => {
+      if (err) res.status(200).send('Maricopa Inventory and Orders API is running.');
     });
   });
 
-  // ==========================================================
-  // GLOBAL ERROR HANDLER
-  // ==========================================================
+  // 404
+  app.use((req, res) => {
+    res.status(404).json({
+      error: 'Route not found',
+      details: [`${req.method} ${req.originalUrl} does not exist`]
+    });
+  });
+
+  // Global error handler
   app.use((err, req, res, next) => {
     logger.error('Unhandled application error', {
       error: err.message,
       path: req.originalUrl,
       method: req.method
     });
-
-    if (res.headersSent) {
-      return next(err);
-    }
-
+    if (res.headersSent) return next(err);
     const status = err.status || err.statusCode || 500;
-
     res.status(status).json({
-      success: false,
-      message: config.IS_PROD
-        ? 'An unexpected server error occurred'
-        : err.message
+      error: config.IS_PROD ? 'An unexpected server error occurred' : err.message,
+      details: config.IS_PROD ? [] : [err.message]
     });
   });
 
-  // ==========================================================
-  // DATABASE INITIALISATION
-  // ==========================================================
   async function initialiseDatabase() {
     await inventoryRepo.ensure();
     await ordersRepo.ensure();
-
     logger.info('Database initialisation completed');
   }
 
-  return {
-    app,
-    mongo,
-    logger,
-    metrics,
-    initialiseDatabase
-  };
+  return { app, mongo, logger, metrics, initialiseDatabase };
 }
 
 // ============================================================
-// 9. SERVER STARTUP + GRACEFUL SHUTDOWN
+// 10. SERVER STARTUP + GRACEFUL SHUTDOWN
 // ============================================================
 async function startServer() {
-  const {
-    app,
-    mongo,
-    logger,
-    initialiseDatabase
-  } = createApp(CONFIG);
+  const { app, mongo, logger, initialiseDatabase } = createApp(CONFIG);
 
   try {
     await initialiseDatabase();
@@ -1194,34 +916,23 @@ async function startServer() {
 
     async function shutdown(signal) {
       if (shuttingDown) return;
-
       shuttingDown = true;
-
       logger.info(`Received ${signal}. Shutting down gracefully...`);
 
       const timeout = setTimeout(() => {
         logger.error('Shutdown timeout reached. Forcing exit.');
         process.exit(1);
       }, CONFIG.SHUTDOWN_TIMEOUT_MS);
-
       timeout.unref();
 
       server.close(async err => {
-        if (err) {
-          logger.error('HTTP server shutdown error', {
-            error: err.message
-          });
-        }
-
+        if (err) logger.error('HTTP server shutdown error', { error: err.message });
         try {
           await mongo.close();
           logger.info('MongoDB connection closed');
         } catch (closeErr) {
-          logger.error('MongoDB shutdown error', {
-            error: closeErr.message
-          });
+          logger.error('MongoDB shutdown error', { error: closeErr.message });
         }
-
         clearTimeout(timeout);
         process.exit(err ? 1 : 0);
       });
@@ -1232,37 +943,25 @@ async function startServer() {
 
     process.on('unhandledRejection', reason => {
       logger.error('Unhandled promise rejection', {
-        error: reason instanceof Error
-          ? reason.message
-          : String(reason)
+        error: reason instanceof Error ? reason.message : String(reason)
       });
     });
 
     process.on('uncaughtException', err => {
-      logger.error('Uncaught exception', {
-        error: err.message,
-        stack: err.stack
-      });
-
+      logger.error('Uncaught exception', { error: err.message, stack: err.stack });
       shutdown('uncaughtException');
     });
 
     return server;
-
   } catch (err) {
-    logger.error('Server startup failed', {
-      error: err.message,
-      stack: err.stack
-    });
-
+    logger.error('Server startup failed', { error: err.message, stack: err.stack });
     await mongo.close();
-
     process.exitCode = 1;
   }
 }
 
 // ============================================================
-// 10. START APPLICATION
+// 11. START
 // ============================================================
 if (require.main === module) {
   startServer();
@@ -1273,6 +972,8 @@ module.exports = {
   loadConfig,
   createMongoRepository,
   createMemoryRepository,
+  buildInventoryRouter,
+  buildOrdersRouter,
   escapeRegex,
   makeId,
   makeReference
