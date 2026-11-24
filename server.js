@@ -1,7 +1,13 @@
 // ============================================================
 // Maricopa · Inventory + Orders Management API (MongoDB)
-// server.js — rewritten to match home.html / inventory.html /
-//             orders.html / analytics.html contracts exactly.
+// server.js — v1.1.0
+// ============================================================
+// NEW in 1.1.0 (all existing routes keep working unchanged):
+//   POST /inventory/bulk-movement        apply a whole receipt at once, all-or-nothing
+//   GET  /inventory/movements            movement history (newest first)
+//   POST /inventory/movements/:id/undo   reverse a movement
+//   Rate limit now also covers /inventory and /orders
+//   Metrics no longer create one key per item id
 // ============================================================
 // Run with: node server.js
 // Requires: npm install express cors helmet express-rate-limit mongodb
@@ -40,14 +46,16 @@ function loadConfig(env = process.env) {
     MONGODB_DB: env.MONGODB_DB || 'maricopa',
     INVENTORY_COLLECTION: env.INVENTORY_COLLECTION || 'inventory',
     ORDERS_COLLECTION: env.ORDERS_COLLECTION || 'orders',
+    MOVEMENTS_COLLECTION: env.MOVEMENTS_COLLECTION || 'movements',
     MONGO_CONNECT_TIMEOUT_MS: Number(env.MONGO_CONNECT_TIMEOUT_MS) || 10000,
 
     PUBLIC_DIR: path.join(__dirname, 'public'),
     BODY_LIMIT: env.BODY_LIMIT || '1mb',
     SHUTDOWN_TIMEOUT_MS: Number(env.SHUTDOWN_TIMEOUT_MS) || 5000,
     RATE_LIMIT_WINDOW_MS: Number(env.RATE_LIMIT_WINDOW_MS) || 60 * 1000,
-    RATE_LIMIT_MAX_PROD: Number(env.RATE_LIMIT_MAX_PROD) || 120,
+    RATE_LIMIT_MAX_PROD: Number(env.RATE_LIMIT_MAX_PROD) || 240,
     RATE_LIMIT_MAX_DEV: Number(env.RATE_LIMIT_MAX_DEV) || 1000,
+    MAX_BULK_LINES: Number(env.MAX_BULK_LINES) || 200,
 
     VALID_CATEGORIES: Object.freeze([
       'Ready-mix', 'Precast', 'Cement',
@@ -57,6 +65,8 @@ function loadConfig(env = process.env) {
     VALID_ORDER_STATUSES: Object.freeze([
       'pending', 'processing', 'shipped', 'delivered', 'cancelled'
     ]),
+
+    VALID_MOVEMENT_TYPES: Object.freeze(['in', 'out']),
 
     CORS_ORIGINS: env.CORS_ORIGINS
       ? env.CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
@@ -202,6 +212,12 @@ function escapeRegex(str) {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Works with both driver styles (v5 returns { value }, v6 returns the document)
+function unwrap(result) {
+  if (result && Object.prototype.hasOwnProperty.call(result, 'value')) return result.value || null;
+  return result || null;
+}
+
 function createMongoRepository(collectionName, mongo, config, logger, label) {
   return {
     async ensure() {
@@ -240,12 +256,13 @@ function createMongoRepository(collectionName, mongo, config, logger, label) {
       }
     },
 
-    async readAll() {
+    async readAll(limit = 0) {
       const db = await mongo.db();
-      return db.collection(collectionName)
+      let cursor = db.collection(collectionName)
         .find({}, { projection: { _id: 0 } })
-        .sort({ createdAt: -1 })
-        .toArray();
+        .sort({ createdAt: -1 });
+      if (limit > 0) cursor = cursor.limit(limit);
+      return cursor.toArray();
     },
 
     async findById(id) {
@@ -267,7 +284,33 @@ function createMongoRepository(collectionName, mongo, config, logger, label) {
         { $set: patch },
         { returnDocument: 'after', projection: { _id: 0 } }
       );
-      return (result && result.value) ? result.value : (result || null);
+      return unwrap(result);
+    },
+
+    // Atomic stock change: $inc quantity by delta, optionally $set other fields.
+    // If minQty > 0 the change only happens when quantity >= minQty (prevents negative stock).
+    // Returns the updated document, or null if the item is missing / stock too low.
+    async adjust(id, delta, set = {}, minQty = 0) {
+      const db = await mongo.db();
+      const filter = { id };
+      if (minQty > 0) filter.quantity = { $gte: minQty };
+      const result = await db.collection(collectionName).findOneAndUpdate(
+        filter,
+        { $inc: { quantity: delta }, $set: set },
+        { returnDocument: 'after', projection: { _id: 0 } }
+      );
+      return unwrap(result);
+    },
+
+    // Atomically update a document only if it is not already marked undone
+    async claim(id, patch) {
+      const db = await mongo.db();
+      const result = await db.collection(collectionName).findOneAndUpdate(
+        { id, undone: { $ne: true } },
+        { $set: patch },
+        { returnDocument: 'after', projection: { _id: 0 } }
+      );
+      return unwrap(result);
     },
 
     async remove(id) {
@@ -276,7 +319,7 @@ function createMongoRepository(collectionName, mongo, config, logger, label) {
         { id },
         { projection: { _id: 0 } }
       );
-      return (result && result.value) ? result.value : (result || null);
+      return unwrap(result);
     },
 
     async clear() {
@@ -292,17 +335,18 @@ function createMongoRepository(collectionName, mongo, config, logger, label) {
 }
 
 // ============================================================
-// 6. IN-MEMORY REPOSITORY (fallback)
+// 6. IN-MEMORY REPOSITORY (fallback / tests)
 // ============================================================
 function createMemoryRepository(label, logger) {
   const items = new Map();
 
   return {
     async ensure() { logger.info(`Memory ${label} repository ready`); },
-    async readAll() {
-      return [...items.values()].sort(
+    async readAll(limit = 0) {
+      const all = [...items.values()].sort(
         (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
       );
+      return limit > 0 ? all.slice(0, limit) : all;
     },
     async findById(id) { return items.get(id) || null; },
     async create(item) {
@@ -313,6 +357,22 @@ function createMemoryRepository(label, logger) {
     async update(id, patch) {
       const existing = items.get(id);
       if (!existing) return null;
+      const updated = { ...existing, ...patch };
+      items.set(id, updated);
+      return updated;
+    },
+    async adjust(id, delta, set = {}, minQty = 0) {
+      const existing = items.get(id);
+      if (!existing) return null;
+      const current = Number(existing.quantity) || 0;
+      if (minQty > 0 && current < minQty) return null;
+      const updated = { ...existing, ...set, quantity: current + delta };
+      items.set(id, updated);
+      return updated;
+    },
+    async claim(id, patch) {
+      const existing = items.get(id);
+      if (!existing || existing.undone) return null;
       const updated = { ...existing, ...patch };
       items.set(id, updated);
       return updated;
@@ -345,6 +405,10 @@ function toNumber(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function round6(n) {
+  return Math.round(n * 1e6) / 1e6;
+}
+
 function isValidDateString(s) {
   return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
@@ -365,8 +429,218 @@ function makeReference() {
 // ============================================================
 // 8. ROUTERS — mounted at both /api/* and /
 // ============================================================
-function buildInventoryRouter({ inventoryRepo, config, logger }) {
+function buildInventoryRouter({ inventoryRepo, movementsRepo, config, logger }) {
   const router = express.Router();
+
+  // ---------- stock-movement helpers (all-or-nothing) ----------
+  // ops: [{ id, delta, price?, priceBefore? }]
+  async function rollback(done) {
+    for (const d of [...done].reverse()) {
+      const set = { updatedAt: new Date().toISOString() };
+      if (d.op.price !== undefined) set.price = d.op.priceBefore;
+      try {
+        await inventoryRepo.adjust(d.op.id, -d.op.delta, set, 0);
+      } catch (err) {
+        logger.error('Rollback step failed', { id: d.op.id, error: err.message });
+      }
+    }
+  }
+
+  async function applyOps(ops) {
+    const done = [];
+    try {
+      for (const op of ops) {
+        const set = { updatedAt: new Date().toISOString() };
+        if (op.price !== undefined) set.price = op.price;
+        const minQty = op.delta < 0 ? -op.delta : 0;
+        const after = await inventoryRepo.adjust(op.id, op.delta, set, minQty);
+        if (!after) {
+          await rollback(done);
+          return { ok: false, failedId: op.id };
+        }
+        done.push({ op, after });
+      }
+      return { ok: true, done };
+    } catch (err) {
+      await rollback(done);
+      throw err;
+    }
+  }
+
+  // ---------- movement history & undo (must be before '/:id') ----------
+  router.get('/movements', async (req, res, next) => {
+    try {
+      const limit = Math.min(200, Math.max(1, toNumber(req.query.limit, 50)));
+      res.json(await movementsRepo.readAll(limit));
+    } catch (err) { next(err); }
+  });
+
+  router.post('/movements/:id/undo', async (req, res, next) => {
+    try {
+      const movement = await movementsRepo.findById(req.params.id);
+      if (!movement) return res.status(404).json({ error: 'Movement not found' });
+      if (movement.undone) return res.status(409).json({ error: 'This movement was already undone' });
+
+      // Build reverse operations
+      const ops = [];
+      const problems = [];
+      for (const line of movement.lines || []) {
+        const item = await inventoryRepo.findById(line.itemId);
+        if (!item) { problems.push(`${line.name} no longer exists`); continue; }
+        const delta = movement.type === 'in' ? -line.quantity : line.quantity;
+        const restorePrice = line.priceUpdated && Number(item.price) === Number(line.unitPrice);
+        ops.push({
+          id: item.id,
+          delta,
+          price: restorePrice ? line.priceBefore : undefined,
+          priceBefore: item.price
+        });
+        if (delta < 0 && (Number(item.quantity) || 0) < -delta) {
+          problems.push(`${item.name}: only ${Number(item.quantity) || 0} left, cannot remove ${-delta}`);
+        }
+      }
+      if (problems.length) {
+        return res.status(409).json({ error: 'Cannot undo this movement', details: problems });
+      }
+
+      // Claim first so a double-click cannot undo twice
+      const claimed = await movementsRepo.claim(movement.id, {
+        undone: true,
+        undoneAt: new Date().toISOString()
+      });
+      if (!claimed) return res.status(409).json({ error: 'This movement was already undone' });
+
+      const result = await applyOps(ops);
+      if (!result.ok) {
+        await movementsRepo.update(movement.id, { undone: false, undoneAt: null });
+        return res.status(409).json({
+          error: 'Stock changed while undoing. Nothing was changed — please retry.'
+        });
+      }
+
+      res.json({
+        success: true,
+        movement: claimed,
+        items: result.done.map(d => d.after)
+      });
+    } catch (err) { next(err); }
+  });
+
+  // ---------- bulk movement (receipt scanner) ----------
+  // Body: { type: 'in'|'out', reference?, note?, source?,
+  //         lines: [{ id, quantity, price?, updatePrice? }] }
+  router.post('/bulk-movement', async (req, res, next) => {
+    try {
+      const body = req.body;
+      if (!isObject(body)) {
+        return res.status(400).json({ error: 'Invalid request body', details: ['Body must be a JSON object'] });
+      }
+
+      const errors = [];
+      const type = cleanString(body.type, 10);
+      if (!config.VALID_MOVEMENT_TYPES.includes(type)) errors.push("type must be 'in' or 'out'");
+      if (!Array.isArray(body.lines) || !body.lines.length) {
+        errors.push('lines must be a non-empty array');
+      } else if (body.lines.length > config.MAX_BULK_LINES) {
+        errors.push(`lines cannot exceed ${config.MAX_BULK_LINES}`);
+      }
+      if (errors.length) return res.status(400).json({ error: 'Validation failed', details: errors });
+
+      // Merge duplicate items so one item is only changed once
+      const merged = new Map();
+      body.lines.forEach((line, i) => {
+        if (!isObject(line)) { errors.push(`lines[${i}] must be an object`); return; }
+        const id = cleanString(line.id, 100);
+        const quantity = toNumber(line.quantity, NaN);
+        if (!id) errors.push(`lines[${i}].id is required`);
+        if (!Number.isFinite(quantity) || quantity <= 0) errors.push(`lines[${i}].quantity must be a number > 0`);
+        let price;
+        if (line.price !== undefined && line.price !== null && line.price !== '') {
+          price = toNumber(line.price, NaN);
+          if (!Number.isFinite(price) || price < 0) errors.push(`lines[${i}].price must be a number >= 0`);
+        }
+        if (errors.length) return;
+        const entry = merged.get(id) || { id, quantity: 0, updatePrice: false };
+        entry.quantity = round6(entry.quantity + quantity);
+        if (price !== undefined) entry.unitPrice = price;
+        if (line.updatePrice === true) entry.updatePrice = true;
+        merged.set(id, entry);
+      });
+      if (errors.length) return res.status(400).json({ error: 'Validation failed', details: errors });
+
+      // Load items and validate before touching anything
+      const missing = [];
+      const insufficient = [];
+      const ops = [];
+      const lines = [];
+      for (const entry of merged.values()) {
+        const item = await inventoryRepo.findById(entry.id);
+        if (!item) { missing.push(`item ${entry.id} not found`); continue; }
+        const current = Number(item.quantity) || 0;
+        if (type === 'out' && entry.quantity > current) {
+          insufficient.push(`${item.name}: need ${entry.quantity}, have ${current}`);
+        }
+        const setPrice = type === 'in' && entry.updatePrice &&
+          entry.unitPrice !== undefined && Number(entry.unitPrice) !== Number(item.price);
+        ops.push({
+          id: item.id,
+          delta: type === 'in' ? entry.quantity : -entry.quantity,
+          price: setPrice ? entry.unitPrice : undefined,
+          priceBefore: item.price
+        });
+        lines.push({
+          itemId: item.id,
+          sku: item.sku,
+          name: item.name,
+          unit: item.unit || 'units',
+          quantity: entry.quantity,
+          unitPrice: entry.unitPrice !== undefined ? entry.unitPrice : null,
+          priceBefore: item.price,
+          priceUpdated: !!setPrice
+        });
+      }
+      if (missing.length) return res.status(404).json({ error: 'Some items were not found', details: missing });
+      if (insufficient.length) return res.status(409).json({ error: 'Insufficient stock', details: insufficient });
+
+      const result = await applyOps(ops);
+      if (!result.ok) {
+        return res.status(409).json({
+          error: 'Stock changed while saving. Nothing was updated — please retry.'
+        });
+      }
+
+      lines.forEach((line, i) => {
+        line.after = round6(Number(result.done[i].after.quantity) || 0);
+        line.before = round6(line.after - ops[i].delta);
+      });
+
+      const movement = {
+        id: makeId(),
+        type,
+        reference: cleanString(body.reference, 100),
+        note: cleanString(body.note, 1000),
+        source: cleanString(body.source, 50) || 'api',
+        lines,
+        undone: false,
+        createdAt: new Date().toISOString()
+      };
+
+      try {
+        await movementsRepo.create(movement);
+      } catch (err) {
+        await rollback(result.done);
+        throw err;
+      }
+
+      res.status(201).json({
+        success: true,
+        movement,
+        items: result.done.map(d => d.after)
+      });
+    } catch (err) { next(err); }
+  });
+
+  // ---------- standard CRUD ----------
 
   // GET /inventory  — frontend expects a bare array
   router.get('/', async (req, res, next) => {
@@ -388,12 +662,10 @@ function buildInventoryRouter({ inventoryRepo, config, logger }) {
         items = items.filter(item => item.category === category);
       }
 
-      // IMPORTANT: bare array — matches frontend `Array.isArray(data)`
       res.json(items);
     } catch (err) { next(err); }
   });
 
-  // GET /inventory/:id (bonus — not used by frontend, harmless)
   router.get('/:id', async (req, res, next) => {
     try {
       const item = await inventoryRepo.findById(req.params.id);
@@ -552,7 +824,6 @@ function buildOrdersRouter({ ordersRepo, config, logger }) {
     } catch (err) { next(err); }
   });
 
-  // GET /orders/:id (bonus)
   router.get('/:id', async (req, res, next) => {
     try {
       const order = await ordersRepo.findById(req.params.id);
@@ -711,7 +982,6 @@ function buildOrdersRouter({ ordersRepo, config, logger }) {
     } catch (err) { next(err); }
   });
 
-  // DELETE /orders/:id
   router.delete('/:id', async (req, res, next) => {
     try {
       const deleted = await ordersRepo.remove(req.params.id);
@@ -720,7 +990,6 @@ function buildOrdersRouter({ ordersRepo, config, logger }) {
     } catch (err) { next(err); }
   });
 
-  // PATCH /orders/:id/status (bonus — not used by frontend)
   router.patch('/:id/status', async (req, res, next) => {
     try {
       const status = cleanString(req.body && req.body.status, 50);
@@ -756,6 +1025,9 @@ function createApp(config = CONFIG) {
   const ordersRepo = createMongoRepository(
     config.ORDERS_COLLECTION, mongo, config, logger, 'orders'
   );
+  const movementsRepo = createMongoRepository(
+    config.MOVEMENTS_COLLECTION, mongo, config, logger, 'movements'
+  );
 
   const app = express();
 
@@ -776,12 +1048,13 @@ function createApp(config = CONFIG) {
   app.use(express.json({ limit: config.BODY_LIMIT }));
   app.use(express.urlencoded({ extended: true, limit: config.BODY_LIMIT }));
 
-  // Request metrics
+  // Request metrics (route pattern only, so ids never create new keys)
   app.use((req, res, next) => {
     const started = Date.now();
     res.on('finish', () => {
       const duration = Date.now() - started;
-      metrics.increment(`${req.method} ${req.route?.path || req.path}`);
+      const pattern = req.route ? (req.baseUrl || '') + req.route.path : 'unmatched';
+      metrics.increment(`${req.method} ${pattern}`);
       metrics.observe('request_duration_ms', duration);
       logger.debug('Request completed', {
         method: req.method, path: req.path,
@@ -791,7 +1064,7 @@ function createApp(config = CONFIG) {
     next();
   });
 
-  // Rate limit — apply only to the API namespaces
+  // Rate limit — covers /api and the bare paths the frontends actually call
   const limiter = rateLimit({
     windowMs: config.RATE_LIMIT_WINDOW_MS,
     max: config.IS_PROD ? config.RATE_LIMIT_MAX_PROD : config.RATE_LIMIT_MAX_DEV,
@@ -799,10 +1072,10 @@ function createApp(config = CONFIG) {
     legacyHeaders: false,
     message: { error: 'Too many requests. Please try again later.' }
   });
-  app.use('/api', limiter);
+  app.use(['/api', '/inventory', '/orders'], limiter);
 
-  // Health check (kept exactly as before, also works at root)
-  const healthHandler = async (req, res) => {
+  // Health check
+  app.get('/health', async (req, res) => {
     try {
       const db = await mongo.db();
       await db.command({ ping: 1 });
@@ -820,34 +1093,34 @@ function createApp(config = CONFIG) {
         database: 'disconnected'
       });
     }
-  };
-  app.get('/health', healthHandler);
+  });
 
   // API root
   app.get('/api', (req, res) => {
     res.json({
       success: true,
       message: 'Maricopa Inventory and Orders API',
-      version: '1.0.0',
+      version: '1.1.0',
       endpoints: {
         health: '/health',
         inventory: '/inventory',
         orders: '/orders',
+        bulkMovement: 'POST /inventory/bulk-movement',
+        movements: 'GET /inventory/movements',
+        undoMovement: 'POST /inventory/movements/:id/undo',
         metrics: '/api/metrics'
       }
     });
   });
 
-  // Metrics
   app.get('/api/metrics', (req, res) => {
     res.json({ success: true, metrics: metrics.snapshot() });
   });
 
   // Build routers once, mount twice
-  const inventoryRouter = buildInventoryRouter({ inventoryRepo, config, logger });
+  const inventoryRouter = buildInventoryRouter({ inventoryRepo, movementsRepo, config, logger });
   const ordersRouter = buildOrdersRouter({ ordersRepo, config, logger });
 
-  // Canonical namespace
   app.use('/api/inventory', inventoryRouter);
   app.use('/api/orders', ordersRouter);
 
@@ -881,14 +1154,15 @@ function createApp(config = CONFIG) {
     if (res.headersSent) return next(err);
     const status = err.status || err.statusCode || 500;
     res.status(status).json({
-      error: config.IS_PROD ? 'An unexpected server error occurred' : err.message,
-      details: config.IS_PROD ? [] : [err.message]
+      error: config.IS_PROD && status >= 500 ? 'An unexpected server error occurred' : err.message,
+      details: config.IS_PROD && status >= 500 ? [] : [err.message]
     });
   });
 
   async function initialiseDatabase() {
     await inventoryRepo.ensure();
     await ordersRepo.ensure();
+    await movementsRepo.ensure();
     logger.info('Database initialisation completed');
   }
 
